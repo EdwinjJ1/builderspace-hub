@@ -4,8 +4,9 @@ import type { DbOrTx } from "../db";
 import { hubArchivedCards } from "../schema";
 
 /**
- * Puts cards in 归档. One already there keeps when and by whom it went, so a
- * second press, or the clean-up racing a person, changes nothing.
+ * Puts cards in 归档 and returns the ones that went. One already there keeps
+ * when and by whom it went, so a second press, or the clean-up racing a
+ * person, changes nothing and is not returned.
  */
 export async function putAway(
   db: DbOrTx,
@@ -15,21 +16,23 @@ export async function putAway(
     by: string | null;
     automatic: boolean;
   },
-): Promise<void> {
-  if (input.cardIds.length === 0) return;
+): Promise<number[]> {
+  if (input.cardIds.length === 0) return [];
   const values = {
     archivedAt: input.at,
     archivedBy: input.by,
     automatic: input.automatic,
   };
-  await db
+  const rows = await db
     .insert(hubArchivedCards)
     .values(input.cardIds.map((cardId) => ({ cardId, ...values })))
     .onConflictDoUpdate({
       target: hubArchivedCards.cardId,
       set: values,
       setWhere: sql`${hubArchivedCards.archivedAt} IS NULL`,
-    });
+    })
+    .returning({ cardId: hubArchivedCards.cardId });
+  return rows.map((row) => row.cardId);
 }
 
 /** Takes a card out of 归档. False when it was not there. */

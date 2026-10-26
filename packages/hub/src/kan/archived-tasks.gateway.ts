@@ -1,11 +1,25 @@
+import type { SQL } from "drizzle-orm";
 import { and, eq, isNotNull, isNull, lte } from "drizzle-orm";
 
 import * as cardRepo from "@kan/db/repository/card.repo";
 import { boards, cards, lists } from "@kan/db/schema";
 
-import type { Db, DbOrTx } from "../db";
+import type { Db, DbOrTx, Tx } from "../db";
 import { hubArchivedCards } from "../schema";
 import { boardVisibleTo } from "./private-boards.gateway";
+
+/**
+ * The card sits in a live list on a live ordinary board: not a template, not
+ * an archived or deleted board. Everything 归档 does is limited to these.
+ */
+function onLiveOrdinaryBoard(): SQL | undefined {
+  return and(
+    eq(boards.type, "regular"),
+    eq(boards.isArchived, false),
+    isNull(boards.deletedAt),
+    isNull(lists.deletedAt),
+  );
+}
 
 /** Where a card lives, for checking who may put it away or bring it back. */
 export interface CardPlace {
@@ -30,10 +44,7 @@ export async function findVisibleCard(
     .where(
       and(
         eq(cards.publicId, cardPublicId),
-        eq(boards.type, "regular"),
-        eq(boards.isArchived, false),
-        isNull(boards.deletedAt),
-        isNull(lists.deletedAt),
+        onLiveOrdinaryBoard(),
         isNull(cards.deletedAt),
         boardVisibleTo(db, viewerId),
       ),
@@ -69,10 +80,7 @@ export async function listCardsOnBoards(db: DbOrTx): Promise<CardOnBoard[]> {
     .leftJoin(hubArchivedCards, eq(hubArchivedCards.cardId, cards.id))
     .where(
       and(
-        eq(boards.type, "regular"),
-        eq(boards.isArchived, false),
-        isNull(boards.deletedAt),
-        isNull(lists.deletedAt),
+        onLiveOrdinaryBoard(),
         isNull(cards.deletedAt),
         isNull(hubArchivedCards.archivedAt),
       ),
@@ -80,9 +88,21 @@ export async function listCardsOnBoards(db: DbOrTx): Promise<CardOnBoard[]> {
 }
 
 /**
- * Cards that went to 归档 at or before `cutoff` and are still there to
- * delete. Read-only.
+ * Cards in 归档 since `cutoff` or earlier that are still there to delete, on a
+ * live ordinary board: a card whose board was archived since is left alone,
+ * like the rest of that board.
  */
+function expiredArchivedCards(cutoff: Date): SQL | undefined {
+  return and(
+    isNotNull(hubArchivedCards.archivedAt),
+    lte(hubArchivedCards.archivedAt, cutoff),
+    isNull(hubArchivedCards.autoDeletedAt),
+    isNull(cards.deletedAt),
+    onLiveOrdinaryBoard(),
+  );
+}
+
+/** The cards due for deletion as of `cutoff`. Read-only. */
 export async function listExpiredArchivedCards(
   db: DbOrTx,
   cutoff: Date,
@@ -91,15 +111,35 @@ export async function listExpiredArchivedCards(
     .select({ id: cards.id })
     .from(hubArchivedCards)
     .innerJoin(cards, eq(cards.id, hubArchivedCards.cardId))
-    .where(
-      and(
-        isNotNull(hubArchivedCards.archivedAt),
-        lte(hubArchivedCards.archivedAt, cutoff),
-        isNull(hubArchivedCards.autoDeletedAt),
-        isNull(cards.deletedAt),
-      ),
-    );
+    .innerJoin(lists, eq(lists.id, cards.listId))
+    .innerJoin(boards, eq(boards.id, lists.boardId))
+    .where(expiredArchivedCards(cutoff));
   return rows.map((row) => row.id);
+}
+
+/**
+ * Locks one card's 归档 row for the rest of the transaction if the card is
+ * still due for deletion, and returns its public id; undefined if someone
+ * restored or deleted it since it was listed. A restore that comes after waits
+ * for the lock and then finds nothing to restore.
+ */
+export async function lockExpiredArchivedCard(
+  tx: Tx,
+  cardId: number,
+  cutoff: Date,
+): Promise<{ publicId: string } | undefined> {
+  const [row] = await tx
+    .select({ publicId: cards.publicId })
+    .from(hubArchivedCards)
+    .innerJoin(cards, eq(cards.id, hubArchivedCards.cardId))
+    .innerJoin(lists, eq(lists.id, cards.listId))
+    .innerJoin(boards, eq(boards.id, lists.boardId))
+    .where(
+      and(eq(hubArchivedCards.cardId, cardId), expiredArchivedCards(cutoff)),
+    )
+    .for("update", { of: hubArchivedCards })
+    .limit(1);
+  return row;
 }
 
 /**
@@ -107,13 +147,18 @@ export async function listExpiredArchivedCards(
  * as the clean-up rather than a person. Kan's signature asks for whoever
  * deleted it; the column is nullable and nobody is the truth here. No activity
  * is logged and no webhook fires: Kan does both in its router, not here.
+ *
+ * Runs inside the caller's transaction so the deletion stands or falls with
+ * the 归档 row's lock and its mark. Kan's repositories are typed for the plain
+ * client, but take a transaction just the same (their own transaction nests as
+ * a savepoint).
  */
 export async function deleteCardUnattended(
-  db: Db,
+  tx: Tx,
   cardId: number,
   at: Date,
 ): Promise<void> {
-  await cardRepo.softDelete(db, {
+  await cardRepo.softDelete(tx as unknown as Db, {
     cardId,
     deletedAt: at,
     deletedBy: null as unknown as string,

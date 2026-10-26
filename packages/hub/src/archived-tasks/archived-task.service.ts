@@ -1,20 +1,24 @@
 import { createLogger } from "@kan/logger";
 
+import type { AuditActor } from "../audit";
 import type { Db } from "../db";
-import type { CardPlace } from "../kan/archived-tasks.gateway";
 import { completionsOf } from "../archive/archive.service";
+import { recordAudit, TIDY_ACTOR } from "../audit";
 import {
   archivedCardIdsInProject,
   deleteCardUnattended,
   findVisibleCard,
   listCardsOnBoards,
   listExpiredArchivedCards,
+  lockExpiredArchivedCard,
 } from "../kan/archived-tasks.gateway";
 import { listViewableProjects } from "../kan/tasks.gateway";
 import { consumeRateLimit } from "../rate-limit";
 import { HubError } from "../shared/errors";
 import { stageOf } from "../tasks/task.policy";
 import {
+  ARCHIVE_AFTER_DAYS,
+  DELETE_AFTER_DAYS,
   deletionCutoff,
   isDueForArchive,
   TIDY_EVERY_SECONDS,
@@ -28,24 +32,38 @@ const log = createLogger("hub-archived-tasks");
  * puts finished tasks away on its own and later deletes them. Reading what is
  * in 归档 is in the task service, next to the boards it is hidden from.
  *
- * Nothing here is audited: moving a task between the board and 归档 is
- * everyday work, like moving it between columns, and Kan does not log that
- * either.
+ * Every change is written to the 操作日志 in the same transaction, the
+ * clean-up's as `TIDY_ACTOR`. Not to Kan's card activity: its types are a
+ * Postgres enum with no "back from 归档", and Kan's own `card.archived` means
+ * deleted. Entries name the task only by its card's public id, never its
+ * title: back-office admins read the log, and the task may sit on a board
+ * they cannot see.
  */
 
 /** Puts a task in 归档, finished or not. Doing it twice changes nothing. */
 export async function archiveTask(
   db: Db,
-  actor: { userId: string },
+  actor: AuditActor & { userId: string },
   input: { cardPublicId: string },
   now: Date,
 ): Promise<void> {
   const card = await editableCard(db, actor.userId, input.cardPublicId);
-  await putAway(db, {
-    cardIds: [card.id],
-    at: now,
-    by: actor.userId,
-    automatic: false,
+  await db.transaction(async (tx) => {
+    const moved = await putAway(tx, {
+      cardIds: [card.id],
+      at: now,
+      by: actor.userId,
+      automatic: false,
+    });
+    if (moved.length === 0) return;
+    await recordAudit(tx, {
+      actor,
+      action: "task.archived",
+      entityType: "task",
+      entityId: input.cardPublicId,
+      summary: "把一个任务移到归档",
+      detail: { project: card.projectPublicId },
+    });
   });
 }
 
@@ -55,14 +73,25 @@ export async function archiveTask(
  */
 export async function restoreTask(
   db: Db,
-  actor: { userId: string },
+  actor: AuditActor & { userId: string },
   input: { cardPublicId: string },
   now: Date,
 ): Promise<void> {
   const card = await editableCard(db, actor.userId, input.cardPublicId);
-  if (!(await bringBack(db, card.id, now))) {
-    throw new HubError("CONFLICT", "这个任务已经不在归档里了，刷新看看。");
-  }
+  await db.transaction(async (tx) => {
+    // Waits for the clean-up if it is deleting this very card right now.
+    if (!(await bringBack(tx, card.id, now))) {
+      throw new HubError("CONFLICT", "这个任务已经不在归档里了，刷新看看。");
+    }
+    await recordAudit(tx, {
+      actor,
+      action: "task.restored",
+      entityType: "task",
+      entityId: input.cardPublicId,
+      summary: "把一个任务从归档恢复",
+      detail: { project: card.projectPublicId },
+    });
+  });
 }
 
 /** The card, if this person may see it and edit tasks in its project. */
@@ -70,7 +99,7 @@ async function editableCard(
   db: Db,
   userId: string,
   cardPublicId: string,
-): Promise<CardPlace> {
+): Promise<{ id: number; projectPublicId: string }> {
   const card = await findVisibleCard(db, cardPublicId, userId);
   const project = card
     ? (await listViewableProjects(db, userId)).find(
@@ -84,7 +113,7 @@ async function editableCard(
   if (!project.canEditTasks) {
     throw new HubError("FORBIDDEN", "你没有修改这个项目里任务的权限。");
   }
-  return card;
+  return { id: card.id, projectPublicId: project.publicId };
 }
 
 export interface TidyResult {
@@ -117,22 +146,62 @@ export async function tidyTasks(db: Db, now: Date): Promise<TidyResult> {
       )
     );
   });
-  await putAway(db, {
-    cardIds: due.map((card) => card.id),
-    at: now,
-    by: null,
-    automatic: true,
+  const publicIds = new Map(due.map((card) => [card.id, card.publicId]));
+  const archived = await db.transaction(async (tx) => {
+    const moved = await putAway(tx, {
+      cardIds: due.map((card) => card.id),
+      at: now,
+      by: null,
+      automatic: true,
+    });
+    for (const cardId of moved) {
+      await recordAudit(tx, {
+        actor: TIDY_ACTOR,
+        action: "task.auto_archived",
+        entityType: "task",
+        entityId: publicIds.get(cardId) ?? null,
+        summary: `自动归档了一个完成满 ${ARCHIVE_AFTER_DAYS} 天的任务`,
+      });
+    }
+    return moved.length;
   });
 
-  const expired = await listExpiredArchivedCards(db, deletionCutoff(now));
-  for (const cardId of expired) {
-    // Kan's delete runs its own transaction. Should the mark fail after it,
-    // the card is still deleted; it only drops out of 我完成的.
-    await deleteCardUnattended(db, cardId, now);
-    await markAutoDeleted(db, cardId, now);
+  let deleted = 0;
+  for (const cardId of await listExpiredArchivedCards(
+    db,
+    deletionCutoff(now),
+  )) {
+    if (await deleteIfStillExpired(db, cardId, now)) deleted += 1;
   }
 
-  return { archived: due.length, deleted: expired.length };
+  return { archived, deleted };
+}
+
+/**
+ * Deletes one card the clean-up listed, unless it was restored or deleted
+ * since: the check, the deletion, the mark that keeps it in 我完成的 and the
+ * log entry run in one transaction holding the 归档 row's lock, so a restore
+ * either lands first (and the card stays) or finds nothing to restore.
+ */
+export async function deleteIfStillExpired(
+  db: Db,
+  cardId: number,
+  now: Date,
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const card = await lockExpiredArchivedCard(tx, cardId, deletionCutoff(now));
+    if (!card) return false;
+    await deleteCardUnattended(tx, cardId, now);
+    await markAutoDeleted(tx, cardId, now);
+    await recordAudit(tx, {
+      actor: TIDY_ACTOR,
+      action: "task.auto_deleted",
+      entityType: "task",
+      entityId: card.publicId,
+      summary: `自动删除了一个在归档里满 ${DELETE_AFTER_DAYS} 天的任务`,
+    });
+    return true;
+  });
 }
 
 const TIDY_KEY = "hub:tidy-tasks";

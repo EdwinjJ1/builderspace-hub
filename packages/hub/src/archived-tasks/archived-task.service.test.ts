@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import * as kanSchema from "@kan/db/schema";
@@ -6,10 +6,11 @@ import * as kanSchema from "@kan/db/schema";
 import type { Db } from "../db";
 import type { ProjectRole } from "../schema";
 import { getArchive } from "../archive/archive.service";
+import { listExpiredArchivedCards } from "../kan/archived-tasks.gateway";
 import { ensureProjectMember } from "../kan/members.gateway";
 import { listTaskRows } from "../kan/tasks.gateway";
 import { getSchedule, planTask } from "../schedule/schedule.service";
-import { hubArchivedCards, hubPrivateBoards } from "../schema";
+import { hubArchivedCards, hubAuditLog, hubPrivateBoards } from "../schema";
 import { HubError } from "../shared/errors";
 import {
   getArchivedTasks,
@@ -18,9 +19,11 @@ import {
   getTaskBoard,
 } from "../tasks/task.service";
 import { createHubTestDb, seedProject, seedUser } from "../testing/test-db";
+import { deletionCutoff } from "./archived-task.policy";
 import {
   archivedCardIds,
   archiveTask,
+  deleteIfStillExpired,
   restoreTask,
   tidyTasks,
   tidyTasksIfDue,
@@ -146,11 +149,25 @@ const join = (user: User, role: ProjectRole = "member") =>
     addedBy: owner.id,
   });
 
+const actorOf = (user: User) => ({ userId: user.id, email: user.email });
+
 const archive = (card: Card, by: User = me, at: Date = now) =>
-  archiveTask(db, { userId: by.id }, { cardPublicId: card.publicId }, at);
+  archiveTask(db, actorOf(by), { cardPublicId: card.publicId }, at);
 
 const restore = (card: Card, by: User = me, at: Date = now) =>
-  restoreTask(db, { userId: by.id }, { cardPublicId: card.publicId }, at);
+  restoreTask(db, actorOf(by), { cardPublicId: card.publicId }, at);
+
+/** The 操作日志, oldest first. */
+const auditEntries = () =>
+  db
+    .select({
+      actorEmail: hubAuditLog.actorEmail,
+      action: hubAuditLog.action,
+      entityId: hubAuditLog.entityId,
+      summary: hubAuditLog.summary,
+    })
+    .from(hubAuditLog)
+    .orderBy(asc(hubAuditLog.id));
 
 async function boardTitles(user: User = me, at: Date = now) {
   const result = await getTaskBoard(db, {
@@ -436,6 +453,72 @@ describe("other places that read tasks", () => {
     expect(await archivedCardIds(db, project.id)).toEqual([card.id]);
     await restore(card);
     expect(await archivedCardIds(db, project.id)).toEqual([]);
+  });
+});
+
+describe("races and leftovers", () => {
+  it("keeps a task that was restored after the clean-up listed it", async () => {
+    const card = await seedCard(board.todo, "差点被删");
+    await archive(card);
+    const later = daysLater(7);
+    expect(await listExpiredArchivedCards(db, deletionCutoff(later))).toEqual([
+      card.id,
+    ]);
+
+    await restore(card, me, later);
+
+    expect(await deleteIfStillExpired(db, card.id, later)).toBe(false);
+    expect(await deletionOf(card)).toEqual({
+      deletedAt: null,
+      deletedBy: null,
+    });
+    expect(await boardTitles(me, later)).toEqual(["差点被删"]);
+  });
+
+  it("leaves nothing to restore once the clean-up deleted the task", async () => {
+    const card = await seedCard(board.todo, "删了");
+    await archive(card);
+    const later = daysLater(7);
+
+    expect(await deleteIfStillExpired(db, card.id, later)).toBe(true);
+    // The card is gone, so it is as if it never existed.
+    expect((await errorOf(restore(card, me, later))).code).toBe("NOT_FOUND");
+  });
+
+  it("does not delete tasks on a board archived since", async () => {
+    const card = await seedCard(board.todo, "看板归档了");
+    await archive(card);
+    await db
+      .update(kanSchema.boards)
+      .set({ isArchived: true })
+      .where(eq(kanSchema.boards.id, board.id));
+
+    expect((await tidyTasks(db, daysLater(8))).deleted).toBe(0);
+    expect(await deletionOf(card)).toEqual({
+      deletedAt: null,
+      deletedBy: null,
+    });
+  });
+});
+
+describe("the 操作日志", () => {
+  it("records every move in and out of 归档, by whom, without the title", async () => {
+    const card = await seedCard(board.todo, "秘密任务");
+    await archive(card);
+    await archive(card); // already there: nothing to record
+    await restore(card);
+    const done = await finishedDaysAgo(3, "做完了");
+    await tidyTasks(db, now);
+    await tidyTasks(db, daysLater(7));
+
+    const entries = await auditEntries();
+    expect(entries.map((e) => [e.actorEmail, e.action, e.entityId])).toEqual([
+      [me.email, "task.archived", card.publicId],
+      [me.email, "task.restored", card.publicId],
+      ["auto-tidy", "task.auto_archived", done.publicId],
+      ["auto-tidy", "task.auto_deleted", done.publicId],
+    ]);
+    expect(entries.some((e) => e.summary.includes("秘密"))).toBe(false);
   });
 });
 
