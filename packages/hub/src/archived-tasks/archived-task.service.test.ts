@@ -457,6 +457,77 @@ describe("other places that read tasks", () => {
   });
 });
 
+describe("the calendar after the clean-up", () => {
+  it("keeps time already spent on a task the clean-up deleted", async () => {
+    const card = await seedCard(board.todo, "排过时间");
+    const startsAt = daysLater(1);
+    const endsAt = new Date(startsAt.getTime() + HOUR);
+    await planTask(
+      db,
+      me.id,
+      { cardPublicId: card.publicId, startsAt, endsAt },
+      now,
+    );
+    await archive(card, me, daysLater(2));
+    await tidyTasks(db, daysLater(9));
+    expect((await deletionOf(card))?.deletedAt).toEqual(daysLater(9));
+
+    const schedule = await getSchedule(db, {
+      userId: me.id,
+      from: now,
+      to: daysLater(7),
+      now: daysLater(9),
+    });
+    expect(schedule.blocks.map((b) => [b.kind, b.title])).toEqual([
+      ["task", "排过时间"],
+    ]);
+    expect(schedule.openTasks).toEqual([]);
+    expect(
+      (
+        await errorOf(
+          planTask(
+            db,
+            me.id,
+            {
+              cardPublicId: card.publicId,
+              startsAt: daysLater(10),
+              endsAt: new Date(daysLater(10).getTime() + HOUR),
+            },
+            daysLater(9),
+          ),
+        )
+      ).code,
+    ).toBe("INVALID_INPUT");
+  });
+
+  it("drops a task someone deleted by hand, as before", async () => {
+    const card = await seedCard(board.todo, "手动删了");
+    const startsAt = daysLater(1);
+    await planTask(
+      db,
+      me.id,
+      {
+        cardPublicId: card.publicId,
+        startsAt,
+        endsAt: new Date(startsAt.getTime() + HOUR),
+      },
+      now,
+    );
+    await db
+      .update(kanSchema.cards)
+      .set({ deletedAt: daysLater(2), deletedBy: me.id })
+      .where(eq(kanSchema.cards.id, card.id));
+
+    const schedule = await getSchedule(db, {
+      userId: me.id,
+      from: now,
+      to: daysLater(7),
+      now: daysLater(3),
+    });
+    expect(schedule.blocks).toEqual([]);
+  });
+});
+
 describe("races and leftovers", () => {
   it("keeps a task that was restored after the clean-up listed it", async () => {
     const card = await seedCard(board.todo, "差点被删");

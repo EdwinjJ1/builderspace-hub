@@ -137,6 +137,7 @@ export async function getSchedule(
       return block ? [block] : [];
     }),
     openTasks: myTasks
+      // A task the clean-up deleted is still marked as archived.
       .filter((task) => task.stage !== "done" && task.archivedAt === null)
       .map((task) => ({ task, planned: plannedPublicIds.has(task.publicId) })),
   };

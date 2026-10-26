@@ -162,15 +162,19 @@ export async function getHome(db: Db, input: ScopeInput): Promise<HomeSummary> {
 
 /**
  * Every task assigned to this person in the projects they can see, finished
- * ones and those in 归档 included. The personal calendar plans against this
- * list, so a task they were taken off or a project they left drops out of it,
- * while time already spent on a task stays when the task goes to 归档.
+ * ones, those in 归档 and those the clean-up deleted from it included. The
+ * personal calendar plans against this list, so a task they were taken off or
+ * a project they left drops out of it, while time already spent on a task
+ * stays when the task goes to 归档 and after it is cleaned up.
  */
 export async function getMyTasks(
   db: Db,
   input: { userId: string; now: Date },
 ): Promise<Task[]> {
-  const { tasks } = await loadScope(db, input, { archived: true });
+  const { tasks } = await loadScope(db, input, {
+    archived: true,
+    autoDeleted: true,
+  });
   return tasks.filter((task) => task.assignedToMe).map(publicTask);
 }
 
