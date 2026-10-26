@@ -1,7 +1,8 @@
 import { createLogger } from "@kan/logger";
 
 import type { AuditActor } from "../audit";
-import type { Db } from "../db";
+import type { Db, DbOrTx } from "../db";
+import type { CardOnBoard } from "../kan/archived-tasks.gateway";
 import { completionsOf } from "../archive/archive.service";
 import { recordAudit, TIDY_ACTOR } from "../audit";
 import {
@@ -10,6 +11,7 @@ import {
   findVisibleCard,
   listCardsOnBoards,
   listExpiredArchivedCards,
+  lockCardsOnBoards,
   lockExpiredArchivedCard,
 } from "../kan/archived-tasks.gateway";
 import { listViewableProjects } from "../kan/tasks.gateway";
@@ -129,14 +131,38 @@ export interface TidyResult {
  * deleted. Safe to run at any time and as often as you like.
  */
 export async function tidyTasks(db: Db, now: Date): Promise<TidyResult> {
-  const finished = (await listCardsOnBoards(db)).filter(
+  const due = await dueForArchive(db, await listCardsOnBoards(db), now);
+  const archived = await archiveIfStillDue(
+    db,
+    due.map((card) => card.id),
+    now,
+  );
+
+  let deleted = 0;
+  for (const cardId of await listExpiredArchivedCards(
+    db,
+    deletionCutoff(now),
+  )) {
+    if (await deleteIfStillExpired(db, cardId, now)) deleted += 1;
+  }
+
+  return { archived, deleted };
+}
+
+/** Which of these cards sit in 已完成 and have waited long enough there. */
+async function dueForArchive(
+  db: DbOrTx,
+  candidates: readonly CardOnBoard[],
+  now: Date,
+): Promise<CardOnBoard[]> {
+  const finished = candidates.filter(
     (card) => stageOf(card.listName) === "done",
   );
   const completions = await completionsOf(
     db,
     finished.map((card) => card.publicId),
   );
-  const due = finished.filter((card) => {
+  return finished.filter((card) => {
     const completion = completions.get(card.publicId);
     return (
       completion !== undefined &&
@@ -146,8 +172,29 @@ export async function tidyTasks(db: Db, now: Date): Promise<TidyResult> {
       )
     );
   });
-  const publicIds = new Map(due.map((card) => [card.id, card.publicId]));
-  const archived = await db.transaction(async (tx) => {
+}
+
+/**
+ * Puts in 归档 those of the cards the clean-up picked that are still due. The
+ * first look was without locks, so in one transaction this locks the cards,
+ * reads them and their history again and decides again: a task reopened, or
+ * moved out and back into 已完成, since then keeps its place. A move that
+ * comes later waits for the transaction and then applies to the archived card.
+ * Returns how many went.
+ */
+export async function archiveIfStillDue(
+  db: Db,
+  cardIds: readonly number[],
+  now: Date,
+): Promise<number> {
+  if (cardIds.length === 0) return 0;
+  return db.transaction(async (tx) => {
+    const due = await dueForArchive(
+      tx,
+      await lockCardsOnBoards(tx, cardIds),
+      now,
+    );
+    const publicIds = new Map(due.map((card) => [card.id, card.publicId]));
     const moved = await putAway(tx, {
       cardIds: due.map((card) => card.id),
       at: now,
@@ -165,16 +212,6 @@ export async function tidyTasks(db: Db, now: Date): Promise<TidyResult> {
     }
     return moved.length;
   });
-
-  let deleted = 0;
-  for (const cardId of await listExpiredArchivedCards(
-    db,
-    deletionCutoff(now),
-  )) {
-    if (await deleteIfStillExpired(db, cardId, now)) deleted += 1;
-  }
-
-  return { archived, deleted };
 }
 
 /**

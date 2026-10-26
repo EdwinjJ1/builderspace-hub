@@ -22,6 +22,7 @@ import { createHubTestDb, seedProject, seedUser } from "../testing/test-db";
 import { deletionCutoff } from "./archived-task.policy";
 import {
   archivedCardIds,
+  archiveIfStillDue,
   archiveTask,
   deleteIfStillExpired,
   restoreTask,
@@ -483,6 +484,33 @@ describe("races and leftovers", () => {
     expect(await deleteIfStillExpired(db, card.id, later)).toBe(true);
     // The card is gone, so it is as if it never existed.
     expect((await errorOf(restore(card, me, later))).code).toBe("NOT_FOUND");
+  });
+
+  it("keeps a task reopened after the clean-up picked it", async () => {
+    const card = await finishedDaysAgo(5, "又要改");
+    // Reopened between the clean-up's first look and its write.
+    await db
+      .update(kanSchema.cards)
+      .set({ listId: board.todo })
+      .where(eq(kanSchema.cards.id, card.id));
+
+    expect(await archiveIfStillDue(db, [card.id], now)).toBe(0);
+    expect(await boardTitles()).toEqual(["又要改"]);
+  });
+
+  it("keeps a task moved out of 已完成 and back since it was picked", async () => {
+    const card = await finishedDaysAgo(5, "刚又做完");
+    await db.insert(kanSchema.cardActivities).values({
+      publicId: nextId(),
+      type: "card.updated.list",
+      cardId: card.id,
+      toListId: board.done,
+      createdBy: me.id,
+      createdAt: daysAgo(0.1),
+    });
+
+    expect(await archiveIfStillDue(db, [card.id], now)).toBe(0);
+    expect(await archiveIfStillDue(db, [card.id], daysLater(3))).toBe(1);
   });
 
   it("does not delete tasks on a board archived since", async () => {

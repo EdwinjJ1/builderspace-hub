@@ -1,5 +1,5 @@
 import type { SQL } from "drizzle-orm";
-import { and, eq, isNotNull, isNull, lte } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lte } from "drizzle-orm";
 
 import * as cardRepo from "@kan/db/repository/card.repo";
 import { boards, cards, lists } from "@kan/db/schema";
@@ -61,12 +61,7 @@ export interface CardOnBoard {
   restoredAt: Date | null;
 }
 
-/**
- * Every live card on a live ordinary board, in any project, that is not in
- * 归档: what the clean-up looks through for finished work. Templates and
- * archived boards are left alone. Read-only.
- */
-export async function listCardsOnBoards(db: DbOrTx): Promise<CardOnBoard[]> {
+function selectCardsOnBoards(db: DbOrTx, only?: SQL) {
   return db
     .select({
       id: cards.id,
@@ -80,11 +75,37 @@ export async function listCardsOnBoards(db: DbOrTx): Promise<CardOnBoard[]> {
     .leftJoin(hubArchivedCards, eq(hubArchivedCards.cardId, cards.id))
     .where(
       and(
+        only,
         onLiveOrdinaryBoard(),
         isNull(cards.deletedAt),
         isNull(hubArchivedCards.archivedAt),
       ),
     );
+}
+
+/**
+ * Every live card on a live ordinary board, in any project, that is not in
+ * 归档: what the clean-up looks through for finished work. Templates and
+ * archived boards are left alone. Read-only.
+ */
+export async function listCardsOnBoards(db: DbOrTx): Promise<CardOnBoard[]> {
+  return selectCardsOnBoards(db);
+}
+
+/**
+ * The same, for just these cards, as they are now, locked for the rest of the
+ * transaction: a move to another column waits until it ends. Cards that left
+ * a live board, were deleted or went to 归档 since are not returned.
+ */
+export async function lockCardsOnBoards(
+  tx: Tx,
+  cardIds: readonly number[],
+): Promise<CardOnBoard[]> {
+  if (cardIds.length === 0) return [];
+  return selectCardsOnBoards(tx, inArray(cards.id, [...cardIds])).for(
+    "update",
+    { of: cards },
+  );
 }
 
 /**
