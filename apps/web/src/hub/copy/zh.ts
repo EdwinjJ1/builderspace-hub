@@ -834,6 +834,9 @@ export const zh = {
       openTask: "打开任务",
       taskNote: "标题和状态跟着任务走，要改请到看板里改。",
       finished: "任务已完成",
+      cleanedUp: "已从归档清理",
+      cleanedUpNote:
+        "这个任务在归档里放满了天数，已经自动删除；这段时间仍然留着。",
     },
     saving: "正在保存…",
   },
