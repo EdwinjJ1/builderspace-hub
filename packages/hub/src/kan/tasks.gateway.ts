@@ -95,6 +95,8 @@ export interface TaskRow {
   dueDate: Date | null;
   createdAt: Date;
   updatedAt: Date | null;
+  /** Who created the card; null when that account is gone. */
+  createdBy: string | null;
   listName: string;
   boardPublicId: string;
   boardName: string;
@@ -141,6 +143,7 @@ export async function listTaskRows(
       dueDate: cards.dueDate,
       createdAt: cards.createdAt,
       updatedAt: cards.updatedAt,
+      createdBy: cards.createdBy,
       deletedAt: cards.deletedAt,
       listName: lists.name,
       boardPublicId: boards.publicId,

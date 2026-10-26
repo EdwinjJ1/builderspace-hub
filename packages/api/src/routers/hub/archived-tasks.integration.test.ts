@@ -122,11 +122,10 @@ describe("hub.tasks.archive and restore", () => {
     expect(await kanBoardTitles(member)).toEqual(["还要做"]);
     expect(await publicBoardTitles()).toEqual(["还要做"]);
     const archived = await hub.tasks.archived({});
-    expect(archived.tasks.map((t) => t.title)).toEqual(["不做了"]);
-    expect(archived.access[project.publicId]).toMatchObject({
-      canEdit: true,
-      canDelete: true,
-    });
+    expect(archived.tasks.map((t) => [t.title, t.canDelete])).toEqual([
+      ["不做了", true],
+    ]);
+    expect(archived.access[project.publicId]).toMatchObject({ canEdit: true });
 
     await hub.tasks.restore({ cardPublicId: card.publicId });
 

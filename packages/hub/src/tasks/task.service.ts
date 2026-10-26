@@ -63,6 +63,11 @@ export interface Task {
   archivedAt: Date | null;
   /** Deleted by the clean-up after its time in 归档; only 我完成的 lists it. */
   deleted: boolean;
+  /**
+   * Whether this person may delete it, by Kan's rule for `card.delete`: the
+   * project's `card:delete` permission, or they created the card.
+   */
+  canDelete: boolean;
 }
 
 export interface Scope {
@@ -89,10 +94,8 @@ export interface TaskColumn {
 /** What the person may do with tasks in one project of the scope. */
 export interface ProjectAccess {
   canCreate: boolean;
-  /** Move, change, put in 归档 and bring back. */
+  /** Move, change, put in 归档 and bring back. Deleting is per task. */
   canEdit: boolean;
-  /** Kan also lets people delete the tasks they created themselves. */
-  canDelete: boolean;
   /** Their membership, for assigning a new task to themselves. */
   memberPublicId: string;
 }
@@ -314,7 +317,6 @@ function accessTo(
       {
         canCreate: project.canCreateTasks,
         canEdit: project.canEditTasks,
-        canDelete: project.canDeleteTasks,
         memberPublicId: project.memberPublicId,
       },
     ]),
@@ -346,7 +348,7 @@ async function loadScope(
     input.userId,
     including,
   );
-  const chips = new Map(inScope.map((p) => [p.id, toChip(p)]));
+  const byId = new Map(inScope.map((p) => [p.id, p]));
 
   return {
     inScope,
@@ -355,7 +357,7 @@ async function loadScope(
       current: current ? toChip(current) : null,
     },
     tasks: rows.flatMap((row) => {
-      const project = chips.get(row.projectId);
+      const project = byId.get(row.projectId);
       return project ? [toTask(row, project, input.userId, input.now)] : [];
     }),
   };
@@ -363,7 +365,7 @@ async function loadScope(
 
 function toTask(
   row: TaskRow,
-  project: ProjectChip,
+  project: ViewableProject,
   userId: string,
   now: Date,
 ): LoadedTask {
@@ -374,7 +376,7 @@ function toTask(
     dueState: dueStateOf(row.dueDate, now),
     stage: stageOf(row.listName),
     functionKey: functionKeyOf(row.boardName),
-    project,
+    project: toChip(project),
     board: { publicId: row.boardPublicId, name: row.boardName },
     listName: row.listName,
     labels: row.labels,
@@ -382,6 +384,10 @@ function toTask(
     assignedToMe: row.assignees.some((assignee) => assignee.userId === userId),
     archivedAt: row.archive?.at ?? null,
     deleted: row.autoDeleted,
+    canDelete:
+      !row.autoDeleted &&
+      (project.canDeleteTasks ||
+        (row.createdBy !== null && row.createdBy === userId)),
     sortDate: row.updatedAt ?? row.createdAt,
     archive: row.archive,
   };

@@ -231,8 +231,6 @@ function Columns({
   const [dragging, setDragging] = useState<HubTask | null>(null);
   const canEdit = (task: HubTask) =>
     board.access[task.project.publicId]?.canEdit ?? false;
-  const canDelete = (task: HubTask) =>
-    board.access[task.project.publicId]?.canDelete ?? false;
 
   return (
     <DndContext
@@ -264,7 +262,6 @@ function Columns({
             column={column}
             fill={fill}
             canEdit={canEdit}
-            canDelete={canDelete}
             onSetDue={onSetDue}
             onArchive={onArchive}
             onDelete={onDelete}
@@ -285,7 +282,6 @@ function TaskColumn({
   column,
   fill,
   canEdit,
-  canDelete,
   onSetDue,
   onArchive,
   onDelete,
@@ -294,7 +290,6 @@ function TaskColumn({
   column: Column;
   fill: boolean;
   canEdit: (task: HubTask) => boolean;
-  canDelete: (task: HubTask) => boolean;
   onSetDue: (task: HubTask, dueDate: Date | null) => void;
   onArchive: (task: HubTask) => void;
   onDelete: (task: HubTask) => void;
@@ -361,7 +356,7 @@ function TaskColumn({
               canEdit={canEdit(task)}
               onSetDue={onSetDue}
               onArchive={canEdit(task) ? onArchive : undefined}
-              onDelete={canDelete(task) ? onDelete : undefined}
+              onDelete={task.canDelete ? onDelete : undefined}
             />
           ))
         )}

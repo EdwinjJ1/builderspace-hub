@@ -158,7 +158,7 @@ function ArchivedList({ archived }: { archived: Archived }) {
                     : undefined
                 }
                 onDelete={
-                  access?.canDelete
+                  task.canDelete
                     ? () =>
                         run(task, () =>
                           remove.mutateAsync({ cardPublicId: task.publicId }),

@@ -271,6 +271,40 @@ describe("putting a task in 归档 by hand", () => {
   });
 });
 
+describe("who may delete a task", () => {
+  it("follows Kan: the project's card:delete, or having created the card", async () => {
+    const guest = await seedUser(db, { email: "guest@example.test" });
+    await join(guest, "guest");
+    await seedCard(board.todo, "别人建的");
+    await db.insert(kanSchema.cards).values({
+      publicId: nextId(),
+      title: "访客自己建的",
+      index: 1,
+      listId: board.todo,
+      createdBy: guest.id,
+    });
+
+    const flags = async (user: User) =>
+      (await getTaskBoard(db, { userId: user.id, view: "all", now })).columns
+        .flatMap((column) => column.tasks)
+        .map((task) => [task.title, task.canDelete])
+        .sort();
+
+    expect(await flags(guest)).toEqual(
+      [
+        ["别人建的", false],
+        ["访客自己建的", true],
+      ].sort(),
+    );
+    expect(await flags(me)).toEqual(
+      [
+        ["别人建的", true],
+        ["访客自己建的", true],
+      ].sort(),
+    );
+  });
+});
+
 describe("bringing a task back", () => {
   it("puts it back on its board", async () => {
     const card = await seedCard(board.todo, "又要做了");
