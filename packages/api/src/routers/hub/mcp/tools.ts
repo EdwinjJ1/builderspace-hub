@@ -472,6 +472,21 @@ export const mcpToolImplementations = {
       if (args.content === undefined && args.title === undefined) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "没有要改的内容" });
       }
+      // A document open to its readers lets them change the content but not
+      // the title. Asked for both, refuse before writing either, so a refused
+      // call leaves the document as it was.
+      if (args.content !== undefined && args.title !== undefined) {
+        const detail = await hub.hub.documents.get({
+          documentPublicId: args.document,
+        });
+        if (!detail.canEdit) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message:
+              "你只能改这份文档的内容；标题只有所有者和被指派的人能改，这次什么都没改",
+          });
+        }
+      }
       // The content first: changing the title moves updatedAt on.
       const replaced =
         args.content === undefined
