@@ -134,7 +134,7 @@ export function BoardCard({
       )}
       <span
         title={task.title}
-        className="mt-0.5 line-clamp-2 block text-sm font-medium leading-5 text-light-1000 dark:text-dark-1000"
+        className="mt-0.5 line-clamp-2 text-sm font-medium leading-5 text-light-1000 dark:text-dark-1000"
       >
         {task.title}
       </span>
